@@ -1,0 +1,672 @@
+class NetscapeGenerator {
+    generate(bookmarks, categories) {
+        let html = `<!DOCTYPE NETSCAPE-Bookmark-file-1>
+<!-- This is an automatically generated file.
+     It will be read and interpreted by browser bookmark managers. -->
+<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">
+<TITLE>Bookmarks</TITLE>
+<H1>Bookmarks</H1>
+<DL><p>
+`;
+
+        const categorized = new Map();
+        const uncategorized = [];
+
+        bookmarks.forEach(bm => {
+            if (bm.categoryId) {
+                if (!categorized.has(bm.categoryId)) categorized.set(bm.categoryId, []);
+                categorized.get(bm.categoryId).push(bm);
+            } else {
+                uncategorized.push(bm);
+            }
+        });
+
+        categories.forEach(cat => {
+            const bms = categorized.get(cat.id) || [];
+            if (bms.length > 0) {
+                html += `    <DT><H3>${cat.name}</H3>\n    <DL><p>\n`;
+                bms.forEach(bm => {
+                    html += `        <DT>${this._generateLink(bm)}\n`;
+                });
+                html += `    </DL><p>\n`;
+            }
+        });
+
+        uncategorized.forEach(bm => {
+            html += `    <DT>${this._generateLink(bm)}\n`;
+        });
+
+        html += `</DL><p>`;
+        return html;
+    }
+
+    _generateLink(bm) {
+        const tags = (bm.tags || []).join(',');
+        return `<A HREF="${bm.url}" ADD_DATE="${Math.floor(Date.now() / 1000)}" TAGS="${tags}">${bm.name}</A>`;
+    }
+}
+
+class NetscapeParser {
+    parse(htmlString) {
+        const bookmarks = [];
+        const categories = new Set();
+        if (!htmlString) return { bookmarks, categories: [] };
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(htmlString, 'text/html');
+        const rootDl = doc.querySelector('dl');
+        if (!rootDl) return { bookmarks, categories: [] };
+        this._traverse(rootDl, null, bookmarks, categories);
+        return {
+            bookmarks,
+            categories: Array.from(categories).map(name => ({ name }))
+        };
+    }
+    _traverse(dl, currentCategory, bookmarks, categories) {
+        const items = dl.children;
+        for (const item of items) {
+            if (item.tagName === 'DT') {
+                const h3 = item.querySelector('h3');
+                const a = item.querySelector('a');
+                if (h3) {
+                    const categoryName = h3.textContent.trim();
+                    categories.add(categoryName);
+                    const siblingDl = item.querySelector('dl') || (item.nextElementSibling && item.nextElementSibling.tagName === 'DL' ? item.nextElementSibling : null);
+                    if (siblingDl) this._traverse(siblingDl, categoryName, bookmarks, categories);
+                } else if (a) {
+                    const tagsStr = a.getAttribute('tags') || '';
+                    bookmarks.push({
+                        name: a.textContent.trim(),
+                        url: a.getAttribute('href'),
+                        categoryName: currentCategory,
+                        tags: tagsStr ? tagsStr.split(',').map(t => t.trim()) : []
+                    });
+                }
+            }
+        }
+    }
+}
+
+const Icons = {
+    search: '<circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>',
+    plus: '<line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line>',
+    upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line>',
+    download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line>',
+    x: '<line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line>',
+    'edit-3': '<path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>',
+    'trash-2': '<polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line>',
+    grid: '<rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect>'
+};
+
+class UI {
+    constructor(db, searchInputId, resultsId, modalId) {
+        this.db = db;
+        this.searchInput = document.getElementById(searchInputId);
+        this.resultsContainer = document.getElementById(resultsId);
+        this.modal = document.getElementById(modalId);
+        this.modalContent = this.modal ? this.modal.querySelector('#modal-content') : null;
+        this.bookmarks = [];
+        this.categories = [];
+        this.filteredResults = [];
+        this.selectedIndex = -1;
+        this.parser = new NetscapeParser();
+        this.generator = new NetscapeGenerator();
+        this._listenersSet = false;
+    }
+
+    renderIcon(name, className = '') {
+        const path = Icons[name];
+        if (!path) return '';
+        return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="${className}">${path}</svg>`;
+    }
+
+    navigate(url) {
+        window.location.assign(url);
+    }
+
+    async init() {
+        await this.refresh();
+        if (!this._listenersSet) {
+            this.setupEventListeners();
+            this._listenersSet = true;
+        }
+    }
+
+    async refresh() {
+        this.categories = await this.db.getCategories();
+        this.bookmarks = await this.db.getBookmarks();
+        this.handleSearch(this.searchInput ? this.searchInput.value : '');
+    }
+
+    setupEventListeners() {
+        if (this.searchInput) {
+            this.searchInput.addEventListener('input', (e) => {
+                this.handleSearch(e.target.value);
+            });
+        }
+
+        const importInput = document.getElementById('import-input');
+        if (importInput) {
+            importInput.addEventListener('change', (e) => this.handleImport(e));
+        }
+
+        const exportBtn = document.querySelector('button[title*="Export"]');
+        if (exportBtn) {
+            exportBtn.addEventListener('click', () => this.showExportModal());
+        }
+
+        // Drag and Drop
+        window.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            document.body.classList.add('bg-zinc-900');
+        });
+
+        window.addEventListener('dragleave', () => {
+            document.body.classList.remove('bg-zinc-900');
+        });
+
+        window.addEventListener('drop', (e) => {
+            e.preventDefault();
+            document.body.classList.remove('bg-zinc-900');
+            const file = e.dataTransfer.files[0];
+            if (file && file.name.endsWith('.html')) {
+                this.handleImport({ target: { files: [file] } });
+            }
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                if (this.modal && !this.modal.classList.contains('hidden')) {
+                    this.hideModal();
+                } else {
+                    this.searchInput.value = '';
+                    this.handleSearch('');
+                }
+                return;
+            }
+
+            if (this.modal && !this.modal.classList.contains('hidden')) return;
+
+            if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+                e.preventDefault();
+                if (this.searchInput) this.searchInput.focus();
+            }
+
+            if ((e.metaKey || e.ctrlKey) && e.key === 'i') {
+                e.preventDefault();
+                this.showModal(this.generateBookmarkForm());
+            }
+
+            if (this.filteredResults.length === 0) return;
+
+            if (e.key === 'ArrowDown' || (e.key === 'Tab' && !e.shiftKey)) {
+                e.preventDefault();
+                if (e.key === 'Tab') {
+                    if (this.selectedIndex === this.filteredResults.length - 1) {
+                        this.selectedIndex = -1;
+                    } else {
+                        this.selectedIndex++;
+                    }
+                } else {
+                    this.selectedIndex = (this.selectedIndex + 1) % this.filteredResults.length;
+                }
+                this.updateSelection();
+            } else if (e.key === 'ArrowUp' || (e.key === 'Tab' && e.shiftKey)) {
+                e.preventDefault();
+                if (e.key === 'Tab') {
+                    if (this.selectedIndex === 0 || this.selectedIndex === -1) {
+                        this.selectedIndex = this.selectedIndex === 0 ? -1 : this.filteredResults.length - 1;
+                    } else {
+                        this.selectedIndex--;
+                    }
+                } else {
+                    this.selectedIndex = (this.selectedIndex - 1 + this.filteredResults.length) % this.filteredResults.length;
+                }
+                this.updateSelection();
+                                } else if (e.key === 'Enter') {
+                                    const target = this.selectedIndex >= 0 ? this.filteredResults[this.selectedIndex] : this.filteredResults[0];
+                                    if (target) {
+                                        e.preventDefault();
+                                        this.navigate(target.url);
+                                    }
+            
+            } else if (e.key === 'e' && this.selectedIndex >= 0) {
+                e.preventDefault();
+                this.showModal(this.generateBookmarkForm(this.filteredResults[this.selectedIndex]));
+            } else if (e.key === 'd' && this.selectedIndex >= 0) {
+                e.preventDefault();
+                this.handleDeleteBookmark(this.filteredResults[this.selectedIndex].id);
+            }
+        });
+    }
+
+    handleSearch(query) {
+        this.filteredResults = this.bookmarks.filter(bm => {
+            const searchStr = `${bm.name} ${bm.url} ${bm.tags.join(' ')}`.toLowerCase();
+            return searchStr.includes(query.toLowerCase());
+        });
+
+        this.filteredResults.sort((a, b) => {
+            if (b.visitCount !== a.visitCount) {
+                return (b.visitCount || 0) - (a.visitCount || 0);
+            }
+            return (b.lastVisited || 0) - (a.lastVisited || 0);
+        });
+
+        this.selectedIndex = -1; // No highlight while typing
+        this.renderResults();
+    }
+
+    updateSelection() {
+        if (this.selectedIndex === -1) {
+            if (this.searchInput) this.searchInput.focus();
+        } else {
+            if (this.searchInput) this.searchInput.blur();
+        }
+
+        Array.from(this.resultsContainer.children).forEach((child, index) => {
+            if (index === this.selectedIndex) {
+                child.classList.add('ring-1', 'ring-zinc-600', 'bg-zinc-800/40');
+                if (child.scrollIntoView) child.scrollIntoView({ block: 'nearest' });
+            } else {
+                child.classList.remove('ring-1', 'ring-zinc-600', 'bg-zinc-800/40');
+            }
+        });
+    }
+
+    showModal(content) {
+        if (!this.modal) return;
+        this.modalContent.innerHTML = content;
+        this.modal.classList.remove('hidden');
+
+        const bookmarkForm = this.modalContent.querySelector('#bookmark-form');
+        if (bookmarkForm) {
+            bookmarkForm.addEventListener('submit', (e) => this.handleBookmarkSubmit(e));
+        }
+
+        const categoryForm = this.modalContent.querySelector('#category-form');
+        if (categoryForm) {
+            categoryForm.addEventListener('submit', (e) => this.handleCategorySubmit(e));
+        }
+
+        const exportForm = this.modalContent.querySelector('#export-form');
+        if (exportForm) {
+            exportForm.addEventListener('submit', (e) => this.handleExportSubmit(e));
+        }
+
+        // Focus first input
+        const firstInput = this.modalContent.querySelector('input:not([type="hidden"])');
+        if (firstInput) setTimeout(() => firstInput.focus(), 10);
+    }
+
+    showExportModal() {
+        this.showModal(this.generateExportForm());
+    }
+
+    showCategoryManagementModal() {
+        this.showModal(this.generateCategoryList());
+    }
+
+    generateExportForm() {
+        return `
+            <div class="flex items-center justify-between mb-8">
+                <h2 class="text-2xl font-bold text-zinc-100 tracking-tight">Export Bookmarks</h2>
+                <button type="button" onclick="ui.hideModal()" class="p-2 hover:bg-zinc-800/50 rounded-lg transition-colors text-zinc-500 hover:text-zinc-100">
+                    ${this.renderIcon('x', 'w-5 h-5')}
+                </button>
+            </div>
+            <form id="export-form" class="space-y-6">
+                <div class="space-y-3 max-h-60 overflow-y-auto pr-2 custom-scrollbar">
+                    <label class="flex items-center gap-3 p-3 bg-zinc-900/50 border border-zinc-800 rounded-xl cursor-pointer hover:border-zinc-600 transition-colors">
+                        <input type="checkbox" id="export-all-cb" checked onchange="Array.from(document.querySelectorAll('.cat-cb')).forEach(cb => cb.checked = this.checked)" class="w-5 h-5 rounded border-zinc-700 bg-zinc-800 text-zinc-100 focus:ring-0">
+                        <span class="font-medium text-zinc-100">Export All</span>
+                    </label>
+                    ${this.categories.map(c => `
+                        <label class="flex items-center gap-3 p-3 bg-zinc-900/50 border border-zinc-800 rounded-xl cursor-pointer hover:border-zinc-600 transition-colors">
+                            <input type="checkbox" name="export-cat" value="${c.id}" checked class="cat-cb w-5 h-5 rounded border-zinc-700 bg-zinc-800 text-zinc-100 focus:ring-0" onchange="document.getElementById('export-all-cb').checked = Array.from(document.querySelectorAll('.cat-cb')).every(cb => cb.checked)">
+                            <span class="w-3 h-3 rounded-full" style="background-color: ${c.color}"></span>
+                            <span class="flex-1 text-zinc-300">${c.name}</span>
+                        </label>
+                    `).join('')}
+                </div>
+                <div class="flex justify-end gap-3 pt-4">
+                    <button type="submit" class="w-full bg-zinc-100 text-zinc-950 py-4 rounded-xl font-bold hover:bg-white transition-all transform active:scale-[0.98]">
+                        Download HTML File
+                    </button>
+                </div>
+            </form>
+        `;
+    }
+
+    async handleExportSubmit(e) {
+        e.preventDefault();
+        const form = e.target;
+        const exportAll = form.querySelector('#export-all-cb').checked;
+        const selectedCatIds = Array.from(form.querySelectorAll('[name="export-cat"]:checked')).map(cb => parseInt(cb.value));
+
+        let bookmarksToExport = this.bookmarks;
+        let categoriesToExport = this.categories;
+
+        if (!exportAll) {
+            bookmarksToExport = this.bookmarks.filter(bm => selectedCatIds.includes(bm.categoryId));
+            categoriesToExport = this.categories.filter(c => selectedCatIds.includes(c.id));
+        }
+
+        const html = this.generator.generate(bookmarksToExport, categoriesToExport);
+        this._downloadFile('alcove_bookmarks.html', html);
+        this.hideModal();
+        this.notify(`Successfully exported ${bookmarksToExport.length} bookmarks`);
+    }
+
+    _downloadFile(filename, text) {
+        const element = document.createElement('a');
+        element.setAttribute('href', 'data:text/html;charset=utf-8,' + encodeURIComponent(text));
+        element.setAttribute('download', filename);
+        element.style.display = 'none';
+        document.body.appendChild(element);
+        element.click();
+        document.body.removeChild(element);
+    }
+
+    notify(message, duration = 3000) {
+        const toast = document.createElement('div');
+        toast.className = 'fixed bottom-8 left-1/2 -translate-x-1/2 glass px-6 py-3 rounded-full text-sm font-medium text-zinc-100 shadow-2xl z-[100] transition-all transform translate-y-10 opacity-0';
+        toast.textContent = message;
+        document.body.appendChild(toast);
+
+        // Animate in
+        setTimeout(() => {
+            toast.classList.remove('translate-y-10', 'opacity-0');
+        }, 10);
+
+        // Animate out and remove
+        setTimeout(() => {
+            toast.classList.add('translate-y-10', 'opacity-0');
+            setTimeout(() => toast.remove(), 300);
+        }, duration);
+    }
+
+    hideModal() {
+        if (!this.modal) return;
+        this.modal.classList.add('hidden');
+        this.modalContent.innerHTML = '';
+        if (this.searchInput) this.searchInput.focus();
+    }
+
+    async handleBookmarkSubmit(e) {
+        e.preventDefault();
+        if (!this.validateBookmarkForm()) return;
+
+        const form = this.modalContent.querySelector('#bookmark-form');
+        const id = form.querySelector('[name="bm-id"]').value;
+        const data = this.gatherBookmarkFormData();
+
+        if (id) {
+            await this.db.updateBookmark({ ...data, id: parseInt(id) });
+        } else {
+            await this.db.addBookmark(data);
+        }
+
+        this.hideModal();
+        await this.refresh();
+    }
+
+    async handleCategorySubmit(e) {
+        e.preventDefault();
+        if (!this.validateCategoryForm()) return;
+
+        const form = this.modalContent.querySelector('#category-form');
+        const id = form.querySelector('[name="cat-id"]').value;
+        const data = this.gatherCategoryFormData();
+
+        if (id) {
+            await this.db.updateCategory({ ...data, id: parseInt(id) });
+        } else {
+            await this.db.addCategory(data);
+        }
+
+        this.hideModal();
+        await this.refresh();
+    }
+
+    async handleImport(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = async (event) => {
+            const html = event.target.result;
+            const results = this.parser.parse(html);
+            await this.db.importData(results);
+            await this.refresh();
+            this.notify(`Successfully imported ${results.bookmarks.length} bookmarks`);
+        };
+        reader.readAsText(file);
+    }
+
+    async handleDeleteBookmark(id) {
+        if (confirm('Are you sure you want to delete this bookmark?')) {
+            await this.db.deleteBookmark(id);
+            await this.refresh();
+        }
+    }
+
+    async handleDeleteCategory(id) {
+        if (confirm('Are you sure you want to delete this category? All bookmarks in this category will become uncategorized.')) {
+            await this.db.deleteCategory(id);
+            await this.refresh();
+        }
+    }
+
+    async seed() {
+        const existing = await this.db.getCategories();
+        if (existing.length > 0) return;
+    }
+
+    generateBookmarkForm(bookmark = null) {
+        const isEdit = !!bookmark;
+        const title = isEdit ? 'Edit Bookmark' : 'Add Bookmark';
+        
+        return `
+            <div class="flex items-center justify-between mb-8">
+                <h2 class="text-2xl font-bold text-zinc-100 tracking-tight">${title}</h2>
+                <button type="button" onclick="ui.hideModal()" class="p-2 hover:bg-zinc-800/50 rounded-lg transition-colors text-zinc-500 hover:text-zinc-100">
+                    ${this.renderIcon('x', 'w-5 h-5')}
+                </button>
+            </div>
+            <form id="bookmark-form" class="space-y-6">
+                <input type="hidden" name="bm-id" value="${bookmark?.id || ''}">
+                <div class="space-y-1">
+                    <label class="block text-[10px] uppercase tracking-widest font-bold text-zinc-500 ml-1">Name</label>
+                    <input type="text" name="bm-name" value="${bookmark?.name || ''}" class="w-full bg-zinc-900/50 border border-zinc-800 focus:border-zinc-600 rounded-xl px-4 py-3 focus:outline-none transition-all text-zinc-100 placeholder:text-zinc-700" placeholder="My Favorite Site" required>
+                </div>
+                <div class="space-y-1">
+                    <label class="block text-[10px] uppercase tracking-widest font-bold text-zinc-500 ml-1">URL</label>
+                    <input type="url" name="bm-url" value="${bookmark?.url || ''}" class="w-full bg-zinc-900/50 border border-zinc-800 focus:border-zinc-600 rounded-xl px-4 py-3 focus:outline-none transition-all text-zinc-100 placeholder:text-zinc-700" placeholder="https://example.com" required>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="space-y-1">
+                        <div class="flex items-center justify-between ml-1">
+                            <label class="block text-[10px] uppercase tracking-widest font-bold text-zinc-500">Category</label>
+                            <button type="button" onclick="ui.showModal(ui.generateCategoryForm())" class="text-[10px] uppercase tracking-widest font-bold text-zinc-400 hover:text-zinc-100 transition-colors">+ New</button>
+                        </div>
+                        <select name="bm-category" class="w-full bg-zinc-900/50 border border-zinc-800 focus:border-zinc-600 rounded-xl px-4 py-3 focus:outline-none transition-all text-zinc-100 appearance-none cursor-pointer">
+                            ${this.categories.map(c => `<option value="${c.id}" ${bookmark?.categoryId === c.id ? 'selected' : ''}>${c.name}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div class="space-y-1">
+                        <label class="block text-[10px] uppercase tracking-widest font-bold text-zinc-500 ml-1">Tags</label>
+                        <input type="text" name="bm-tags" value="${bookmark?.tags?.join(', ') || ''}" class="w-full bg-zinc-900/50 border border-zinc-800 focus:border-zinc-600 rounded-xl px-4 py-3 focus:outline-none transition-all text-zinc-100 placeholder:text-zinc-700" placeholder="dev, social">
+                    </div>
+                </div>
+                <div class="flex justify-end gap-3 pt-4">
+                    <button type="submit" class="w-full bg-zinc-100 text-zinc-950 py-4 rounded-xl font-bold hover:bg-white transition-all transform active:scale-[0.98]">
+                        ${isEdit ? 'Save Changes' : 'Add Bookmark'}
+                    </button>
+                </div>
+            </form>
+        `;
+    }
+
+    validateBookmarkForm() {
+        const form = this.modalContent.querySelector('#bookmark-form');
+        const name = form.querySelector('[name="bm-name"]').value.trim();
+        const url = form.querySelector('[name="bm-url"]').value.trim();
+        return name.length > 0 && url.length > 0;
+    }
+
+    gatherBookmarkFormData() {
+        const form = this.modalContent.querySelector('#bookmark-form');
+        const tags = form.querySelector('[name="bm-tags"]').value
+            .split(',')
+            .map(t => t.trim())
+            .filter(t => t.length > 0);
+
+        return {
+            name: form.querySelector('[name="bm-name"]').value.trim(),
+            url: form.querySelector('[name="bm-url"]').value.trim(),
+            categoryId: parseInt(form.querySelector('[name="bm-category"]').value),
+            tags: tags
+        };
+    }
+
+    generateCategoryForm(category = null) {
+        const isEdit = !!category;
+        const title = isEdit ? 'Edit Category' : 'Add Category';
+        
+        return `
+            <div class="flex items-center justify-between mb-8">
+                <h2 class="text-2xl font-bold text-zinc-100 tracking-tight">${title}</h2>
+                <button type="button" onclick="ui.showModal(ui.generateCategoryList())" class="p-2 hover:bg-zinc-800/50 rounded-lg transition-colors text-zinc-500 hover:text-zinc-100">
+                    ${this.renderIcon('x', 'w-5 h-5')}
+                </button>
+            </div>
+            <form id="category-form" class="space-y-6">
+                <input type="hidden" name="cat-id" value="${category?.id || ''}">
+                <div class="space-y-1">
+                    <label class="block text-[10px] uppercase tracking-widest font-bold text-zinc-500 ml-1">Name</label>
+                    <input type="text" name="cat-name" value="${category?.name || ''}" class="w-full bg-zinc-900/50 border border-zinc-800 focus:border-zinc-600 rounded-xl px-4 py-3 focus:outline-none transition-all text-zinc-100 placeholder:text-zinc-700" placeholder="Work" required>
+                </div>
+                <div class="space-y-1">
+                    <label class="block text-[10px] uppercase tracking-widest font-bold text-zinc-500 ml-1">Color</label>
+                    <label class="flex items-center gap-4 bg-zinc-900/50 border border-zinc-800 rounded-xl px-4 py-3 cursor-pointer hover:border-zinc-600 transition-colors group">
+                        <input type="color" name="cat-color" value="${category?.color || '#3b82f6'}" class="w-8 h-8 bg-transparent border-none rounded-full cursor-pointer overflow-hidden [&::-webkit-color-swatch-wrapper]:p-0 [&::-webkit-color-swatch]:border-none [&::-webkit-color-swatch]:rounded-full" oninput="document.getElementById('color-hex').textContent = this.value">
+                        <span class="text-sm text-zinc-400 font-mono uppercase tracking-wider group-hover:text-zinc-200 transition-colors" id="color-hex">${category?.color || '#3b82f6'}</span>
+                    </label>
+                </div>
+                <div class="flex justify-end gap-3 pt-4">
+                    <button type="submit" class="w-full bg-zinc-100 text-zinc-950 py-4 rounded-xl font-bold hover:bg-white transition-all transform active:scale-[0.98]">
+                        ${isEdit ? 'Save Changes' : 'Add Category'}
+                    </button>
+                </div>
+            </form>
+        `;
+    }
+
+    validateCategoryForm() {
+        const form = this.modalContent.querySelector('#category-form');
+        const name = form.querySelector('[name="cat-name"]').value.trim();
+        return name.length > 0;
+    }
+
+    gatherCategoryFormData() {
+        const form = this.modalContent.querySelector('#category-form');
+        return {
+            name: form.querySelector('[name="cat-name"]').value.trim(),
+            color: form.querySelector('[name="cat-color"]').value
+        };
+    }
+
+    generateCategoryList() {
+        return `
+            <div class="flex items-center justify-between mb-8">
+                <h2 class="text-2xl font-bold text-zinc-100 tracking-tight">Manage Categories</h2>
+                <button type="button" onclick="ui.hideModal()" class="p-2 hover:bg-zinc-800/50 rounded-lg transition-colors text-zinc-500 hover:text-zinc-100">
+                    ${this.renderIcon('x', 'w-5 h-5')}
+                </button>
+            </div>
+            <div class="space-y-3 mb-8">
+                <button onclick="ui.showModal(ui.generateCategoryForm())" class="w-full p-4 glass rounded-xl border-dashed border-zinc-700 hover:border-zinc-500 transition-all text-zinc-400 hover:text-zinc-100 flex items-center justify-center gap-2">
+                    ${this.renderIcon('plus', 'w-5 h-5')}
+                    <span class="font-medium">Create New Category</span>
+                </button>
+            </div>
+            <div class="space-y-2 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
+                ${this.categories.sort((a, b) => a.name.localeCompare(b.name)).map(c => `
+                    <div onclick="ui.showModal(ui.generateCategoryForm(ui.categories.find(cat => cat.id === ${c.id})))" class="flex items-center justify-between p-4 glass rounded-xl group cursor-pointer hover:bg-zinc-800/50 transition-all">
+                        <div class="flex items-center gap-4">
+                            <span class="w-4 h-4 rounded-full" style="background-color: ${c.color}"></span>
+                            <span class="font-medium text-zinc-100">${c.name}</span>
+                        </div>
+                        <div class="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <button class="p-2 hover:bg-zinc-700/50 rounded-lg text-zinc-500 hover:text-zinc-100 transition-colors" title="Edit">
+                                ${this.renderIcon('edit-3', 'w-4 h-4')}
+                            </button>
+                            <button onclick="event.stopPropagation(); ui.handleDeleteCategory(${c.id})" class="p-2 hover:bg-red-900/30 rounded-lg text-zinc-500 hover:text-red-400 transition-colors" title="Delete">
+                                ${this.renderIcon('trash-2', 'w-4 h-4')}
+                            </button>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    }
+
+    renderResults() {
+        this.resultsContainer.innerHTML = '';
+        this.filteredResults.forEach((bm, index) => {
+            const category = this.categories.find(c => c.id === bm.categoryId);
+            const div = document.createElement('div');
+            div.className = 'result-item flex items-center justify-between p-4 glass rounded-xl cursor-pointer group mb-1';
+            if (index === this.selectedIndex) {
+                div.classList.add('ring-1', 'ring-zinc-600', 'bg-zinc-800/40');
+            }
+            div.innerHTML = `
+                <div class="flex items-center gap-4">
+                    <div class="w-10 h-10 rounded-xl bg-zinc-800/50 flex items-center justify-center overflow-hidden border border-zinc-700/30">
+                        <img src="https://www.google.com/s2/favicons?sz=64&domain=${bm.url}" class="w-6 h-6" alt="" onerror="this.style.display='none'">
+                    </div>
+                    <div>
+                        <div class="font-medium text-zinc-100">${bm.name}</div>
+                        <div class="text-xs text-zinc-500 flex items-center gap-2 mt-0.5">
+                            ${category ? `<span class="w-2 h-2 rounded-full" style="background-color: ${category.color}"></span> ${category.name}` : ''}
+                            ${bm.tags.map(t => `<span class="bg-zinc-800/80 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider text-zinc-400">${t}</span>`).join('')}
+                        </div>
+                    </div>
+                </div>
+                <div class="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button class="edit-btn p-2 hover:bg-zinc-700/50 rounded-lg text-zinc-500 hover:text-zinc-100 transition-colors" title="Edit (E)">
+                        ${this.renderIcon('edit-3', 'w-4 h-4')}
+                    </button>
+                    <button class="delete-btn p-2 hover:bg-red-900/30 rounded-lg text-zinc-500 hover:text-red-400 transition-colors" title="Delete (D)">
+                        ${this.renderIcon('trash-2', 'w-4 h-4')}
+                    </button>
+                    <div class="ml-2 text-[10px] text-zinc-600 font-mono tracking-tighter uppercase hidden md:block">
+                        Jump to →
+                    </div>
+                </div>
+            `;
+            
+            div.addEventListener('click', (e) => {
+                if (e.target.closest('.edit-btn') || e.target.closest('.delete-btn')) return;
+                this.navigate(bm.url);
+            });
+
+            div.querySelector('.edit-btn').addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.showModal(this.generateBookmarkForm(bm));
+            });
+
+            div.querySelector('.delete-btn').addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.handleDeleteBookmark(bm.id);
+            });
+
+            this.resultsContainer.appendChild(div);
+        });
+    }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+
+    module.exports = { UI, Icons };
+
+}
